@@ -1,0 +1,226 @@
+package httpserver
+
+import (
+	"encoding/json"
+	"net/http"
+
+	"github.com/Muddyscode/ledger-api/internal/ledger"
+	"github.com/Muddyscode/ledger-api/internal/money"
+	"github.com/Muddyscode/ledger-api/internal/store"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+)
+
+type transferReq struct {
+	DebitAccountID  string          `json:"debit_account_id"`
+	CreditAccountID string          `json:"credit_account_id"`
+	AmountMinor     json.RawMessage `json:"amount_minor"`
+	Description     string          `json:"description"`
+}
+
+type journalLineReq struct {
+	AccountID   string          `json:"account_id"`
+	Direction   string          `json:"direction"`
+	AmountMinor json.RawMessage `json:"amount_minor"`
+}
+
+type journalReq struct {
+	Description string           `json:"description"`
+	Postings    []journalLineReq `json:"postings"`
+}
+
+type txResult struct {
+	status int
+	body   []byte
+}
+
+func (s *Server) postTransfer(w http.ResponseWriter, r *http.Request) {
+	key, ok := requireIdempotencyKey(w, r)
+	if !ok {
+		return
+	}
+	raw, ok := s.readBody(w, r)
+	if !ok {
+		return
+	}
+	var in transferReq
+	if err := json.Unmarshal(raw, &in); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", "invalid JSON")
+		return
+	}
+	debitID, err := uuid.Parse(in.DebitAccountID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_journal", "debit_account_id is invalid")
+		return
+	}
+	creditID, err := uuid.Parse(in.CreditAccountID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_journal", "credit_account_id is invalid")
+		return
+	}
+	amount, err := money.ParseJSONAmount(in.AmountMinor)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, ledger.CodeInvalidAmount, err.Error())
+		return
+	}
+	s.postLines(w, r, key, canonicalHash(raw), in.Description, []ledger.Line{
+		{AccountID: debitID, Direction: ledger.Debit, Amount: amount},
+		{AccountID: creditID, Direction: ledger.Credit, Amount: amount},
+	}, true, nil)
+}
+
+func (s *Server) postJournal(w http.ResponseWriter, r *http.Request) {
+	key, ok := requireIdempotencyKey(w, r)
+	if !ok {
+		return
+	}
+	raw, ok := s.readBody(w, r)
+	if !ok {
+		return
+	}
+	var in journalReq
+	if err := json.Unmarshal(raw, &in); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", "invalid JSON")
+		return
+	}
+	lines := make([]ledger.Line, 0, len(in.Postings))
+	for _, p := range in.Postings {
+		id, err := uuid.Parse(p.AccountID)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_journal", "account_id is invalid")
+			return
+		}
+		amt, err := money.ParseJSONAmount(p.AmountMinor)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, ledger.CodeInvalidAmount, err.Error())
+			return
+		}
+		lines = append(lines, ledger.Line{
+			AccountID: id,
+			Direction: ledger.Direction(p.Direction),
+			Amount:    amt,
+		})
+	}
+	s.postLines(w, r, key, canonicalHash(raw), in.Description, lines, false, nil)
+}
+
+func (s *Server) reverseJournal(w http.ResponseWriter, r *http.Request) {
+	key, ok := requireIdempotencyKey(w, r)
+	if !ok {
+		return
+	}
+	id, ok := s.parseID(w, r)
+	if !ok {
+		return
+	}
+	raw, ok := s.readBody(w, r)
+	if !ok {
+		return
+	}
+	if len(raw) == 0 {
+		raw = []byte(`{}`)
+	}
+	op := s.operator(r)
+	orig, err := s.store.GetJournal(r.Context(), s.store.Pool, op.ID, id)
+	if err != nil {
+		writeLedgerError(w, err)
+		return
+	}
+	if _, exists, err := s.store.ReversalOf(r.Context(), s.store.Pool, op.ID, orig.ID); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", "internal error")
+		return
+	} else if exists {
+		writeError(w, http.StatusConflict, ledger.CodeAlreadyReversed, "journal already reversed")
+		return
+	}
+	s.postLines(w, r, key, canonicalHash(raw), "reversal of "+orig.ID.String(), ledger.ReverseLines(orig.Postings), false, &orig.ID)
+}
+
+func (s *Server) postLines(w http.ResponseWriter, r *http.Request, key string, hash []byte, desc string, lines []ledger.Line, enforcePairs bool, reverses *uuid.UUID) {
+	op := s.operator(r)
+	var result txResult
+	err := s.withTx(r.Context(), func(tx pgx.Tx) error {
+		rec, err := s.store.ClaimIdempotency(r.Context(), tx, op.ID, key, hash)
+		if err != nil {
+			return err
+		}
+		if rec.Replay {
+			result = txResult{status: rec.HTTPStatus, body: rec.Body}
+			return nil
+		}
+		j, err := ledger.Post(r.Context(), tx, s.poster(), ledger.PostRequest{
+			OperatorID:           op.ID,
+			Description:          desc,
+			Lines:                lines,
+			ReversesJournalID:    reverses,
+			EnforceTransferPairs: enforcePairs,
+			IdempotencyKey:       key,
+		})
+		if err != nil {
+			return err
+		}
+		body, err := json.Marshal(jJSON(j))
+		if err != nil {
+			return err
+		}
+		if err := s.store.CompleteIdempotency(r.Context(), tx, op.ID, key, http.StatusCreated, body, j.ID); err != nil {
+			return err
+		}
+		result = txResult{status: http.StatusCreated, body: body}
+		return nil
+	})
+	if err != nil {
+		if store.IsUnique(err, nil) && reverses != nil {
+			writeError(w, http.StatusConflict, ledger.CodeAlreadyReversed, "journal already reversed")
+			return
+		}
+		writeLedgerError(w, err)
+		return
+	}
+	if result.status == 0 {
+		writeError(w, http.StatusInternalServerError, "internal", "internal error")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(result.status)
+	_, _ = w.Write(append(result.body, '\n'))
+}
+
+func (s *Server) getJournal(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.parseID(w, r)
+	if !ok {
+		return
+	}
+	j, err := s.store.GetJournal(r.Context(), s.store.Pool, s.operator(r).ID, id)
+	if err != nil {
+		writeLedgerError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, jJSON(j))
+}
+
+func (s *Server) listJournals(w http.ResponseWriter, r *http.Request) {
+	s.listJournalKind(w, r, false)
+}
+
+func (s *Server) listTransfers(w http.ResponseWriter, r *http.Request) {
+	s.listJournalKind(w, r, true)
+}
+
+func (s *Server) listJournalKind(w http.ResponseWriter, r *http.Request, twoLegged bool) {
+	limit := limitParam(r, 50, 200)
+	js, err := s.store.ListJournals(r.Context(), s.store.Pool, s.operator(r).ID, limit, twoLegged)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", "internal error")
+		return
+	}
+	out := make([]journalJSON, 0, len(js))
+	for _, j := range js {
+		out = append(out, jJSON(j))
+	}
+	key := "journals"
+	if twoLegged {
+		key = "transfers"
+	}
+	writeJSON(w, http.StatusOK, map[string]any{key: out})
+}

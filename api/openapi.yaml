@@ -1,0 +1,223 @@
+openapi: 3.0.3
+info:
+  title: Ledger API
+  version: 1.0.0
+  description: |
+    Double-entry ledger. Amounts are integer kobo (NGN). Posted journals are immutable.
+    Transfers require the Idempotency-Key header.
+servers:
+  - url: http://localhost:8080
+paths:
+  /v1/health:
+    get:
+      summary: Liveness plus database ping
+      responses:
+        "200":
+          description: ok
+  /v1/auth/register:
+    post:
+      summary: Register an operator
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Credentials"
+      responses:
+        "201":
+          description: created
+  /v1/auth/login:
+    post:
+      summary: Login
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Credentials"
+      responses:
+        "200":
+          description: token
+  /v1/auth/me:
+    get:
+      security: [{bearerAuth: []}]
+      responses:
+        "200":
+          description: current operator
+  /v1/accounts:
+    get:
+      security: [{bearerAuth: []}]
+      parameters:
+        - in: query
+          name: type
+          schema: {type: string, enum: [asset, liability, equity, income, expense]}
+      responses:
+        "200":
+          description: list
+    post:
+      security: [{bearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateAccount"
+      responses:
+        "201":
+          description: created
+  /v1/accounts/{id}:
+    get:
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: "#/components/parameters/ID"
+      responses:
+        "200":
+          description: account
+        "404":
+          description: not found
+  /v1/accounts/{id}/statement:
+    get:
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: "#/components/parameters/ID"
+      responses:
+        "200":
+          description: statement
+  /v1/accounts/{id}/close:
+    post:
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: "#/components/parameters/ID"
+      responses:
+        "200":
+          description: closed
+  /v1/transfers:
+    get:
+      security: [{bearerAuth: []}]
+      responses:
+        "200":
+          description: two-legged journals
+    post:
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Transfer"
+      responses:
+        "201":
+          description: posted
+  /v1/transfers/{id}:
+    get:
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: "#/components/parameters/ID"
+      responses:
+        "200":
+          description: journal
+  /v1/journals:
+    get:
+      security: [{bearerAuth: []}]
+      responses:
+        "200":
+          description: journals
+    post:
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Journal"
+      responses:
+        "201":
+          description: posted
+  /v1/journals/{id}:
+    get:
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: "#/components/parameters/ID"
+      responses:
+        "200":
+          description: journal
+  /v1/journals/{id}/reversal:
+    post:
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: "#/components/parameters/ID"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      responses:
+        "201":
+          description: reversing journal posted
+  /v1/invariants:
+    get:
+      security: [{bearerAuth: []}]
+      summary: Chart identity (must be 0) and cache-vs-journal drift
+      responses:
+        "200":
+          description: proof
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  parameters:
+    ID:
+      in: path
+      name: id
+      required: true
+      schema: {type: string, format: uuid}
+    IdempotencyKey:
+      in: header
+      name: Idempotency-Key
+      required: true
+      schema: {type: string, maxLength: 256}
+  schemas:
+    Credentials:
+      type: object
+      required: [email, password]
+      properties:
+        email: {type: string}
+        password: {type: string, minLength: 12}
+    CreateAccount:
+      type: object
+      required: [code, name, type]
+      properties:
+        code: {type: string}
+        name: {type: string}
+        type: {type: string, enum: [asset, liability, equity, income, expense]}
+        allow_negative: {type: boolean}
+    Transfer:
+      type: object
+      required: [debit_account_id, credit_account_id, amount_minor]
+      properties:
+        debit_account_id: {type: string, format: uuid}
+        credit_account_id: {type: string, format: uuid}
+        amount_minor:
+          type: integer
+          format: int64
+          minimum: 1
+          description: kobo; JSON integer only, never a float
+        description: {type: string}
+    Journal:
+      type: object
+      required: [postings]
+      properties:
+        description: {type: string}
+        postings:
+          type: array
+          minItems: 2
+          maxItems: 20
+          items:
+            type: object
+            required: [account_id, direction, amount_minor]
+            properties:
+              account_id: {type: string, format: uuid}
+              direction: {type: string, enum: [debit, credit]}
+              amount_minor: {type: integer, format: int64, minimum: 1}

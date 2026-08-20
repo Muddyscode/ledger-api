@@ -1,0 +1,222 @@
+package integration
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/Muddyscode/ledger-api/internal/config"
+	"github.com/Muddyscode/ledger-api/internal/httpserver"
+	"github.com/Muddyscode/ledger-api/internal/store"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+var testPool *pgxpool.Pool
+
+func TestMain(m *testing.M) {
+	dsn := os.Getenv("LEDGER_TEST_DATABASE_URL")
+	if dsn == "" {
+		dsn = "postgres://ledger:ledger@127.0.0.1:5432/ledger_test?sslmode=disable"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil || pool.Ping(ctx) != nil {
+		if os.Getenv("LEDGER_REQUIRE_DB") == "1" {
+			fmt.Fprintln(os.Stderr, "LEDGER_REQUIRE_DB=1 but postgres is unreachable:", dsn, err)
+			os.Exit(1)
+		}
+		fmt.Fprintln(os.Stderr, "integration tests skipped: no postgres (set LEDGER_TEST_DATABASE_URL)")
+		os.Exit(0)
+	}
+	if err := store.Migrate(context.Background(), pool); err != nil {
+		fmt.Fprintln(os.Stderr, "migrate:", err)
+		os.Exit(1)
+	}
+	testPool = pool
+	code := m.Run()
+	pool.Close()
+	os.Exit(code)
+}
+
+type apiClient struct {
+	t     *testing.T
+	srv   *httptest.Server
+	token string
+}
+
+func startAPI(t *testing.T) *apiClient {
+	t.Helper()
+	st := store.New(testPool)
+	cfg := config.Config{
+		JWTSecret:     "test-secret-must-be-32-bytes-ok!",
+		AllowRegister: true,
+	}
+	api := httpserver.New(cfg, st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	srv := httptest.NewServer(api.Router())
+	t.Cleanup(srv.Close)
+	return &apiClient{t: t, srv: srv}
+}
+
+func (c *apiClient) do(method, path string, body any, extra http.Header) *http.Response {
+	c.t.Helper()
+	var rdr io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			c.t.Fatal(err)
+		}
+		rdr = bytes.NewReader(b)
+	}
+	req, err := http.NewRequest(method, c.srv.URL+path, rdr)
+	if err != nil {
+		c.t.Fatal(err)
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	for k, vs := range extra {
+		for _, v := range vs {
+			req.Header.Set(k, v)
+		}
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		c.t.Fatal(err)
+	}
+	return res
+}
+
+func (c *apiClient) doRaw(method, path, raw string, extra http.Header) *http.Response {
+	c.t.Helper()
+	req, err := http.NewRequest(method, c.srv.URL+path, bytes.NewBufferString(raw))
+	if err != nil {
+		c.t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	for k, vs := range extra {
+		for _, v := range vs {
+			req.Header.Set(k, v)
+		}
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		c.t.Fatal(err)
+	}
+	return res
+}
+
+func decode(t *testing.T, res *http.Response, dest any) {
+	t.Helper()
+	defer res.Body.Close()
+	b, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dest == nil {
+		return
+	}
+	if err := json.Unmarshal(b, dest); err != nil {
+		t.Fatalf("decode %s: %s", err, b)
+	}
+}
+
+func (c *apiClient) register() {
+	c.t.Helper()
+	email := fmt.Sprintf("op-%s@test.local", uuid.NewString()[:8])
+	res := c.do(http.MethodPost, "/v1/auth/register", map[string]string{
+		"email": email, "password": "change-me-now-12",
+	}, nil)
+	var out struct {
+		Token string `json:"token"`
+	}
+	decode(c.t, res, &out)
+	if res.StatusCode != http.StatusCreated {
+		c.t.Fatalf("register %d", res.StatusCode)
+	}
+	c.token = out.Token
+}
+
+func (c *apiClient) createAccount(code, name, typ string) string {
+	c.t.Helper()
+	res := c.do(http.MethodPost, "/v1/accounts", map[string]any{
+		"code": code, "name": name, "type": typ,
+	}, nil)
+	var out struct {
+		ID string `json:"id"`
+	}
+	decode(c.t, res, &out)
+	if res.StatusCode != http.StatusCreated {
+		c.t.Fatalf("create account %s: %d", code, res.StatusCode)
+	}
+	return out.ID
+}
+
+func (c *apiClient) postJournal(key string, body any) (*http.Response, map[string]any) {
+	c.t.Helper()
+	h := http.Header{}
+	h.Set("Idempotency-Key", key)
+	res := c.do(http.MethodPost, "/v1/journals", body, h)
+	var out map[string]any
+	decode(c.t, res, &out)
+	return res, out
+}
+
+func (c *apiClient) postTransfer(key, debit, credit string, amount int64, desc string) (*http.Response, map[string]any) {
+	c.t.Helper()
+	h := http.Header{}
+	h.Set("Idempotency-Key", key)
+	res := c.do(http.MethodPost, "/v1/transfers", map[string]any{
+		"debit_account_id": debit, "credit_account_id": credit,
+		"amount_minor": amount, "description": desc,
+	}, h)
+	var out map[string]any
+	decode(c.t, res, &out)
+	return res, out
+}
+
+func (c *apiClient) identity() map[string]any {
+	c.t.Helper()
+	res := c.do(http.MethodGet, "/v1/invariants", nil, nil)
+	var out map[string]any
+	decode(c.t, res, &out)
+	if res.StatusCode != 200 {
+		c.t.Fatalf("invariants %d %v", res.StatusCode, out)
+	}
+	return out
+}
+
+func (c *apiClient) account(id string) map[string]any {
+	c.t.Helper()
+	res := c.do(http.MethodGet, "/v1/accounts/"+id, nil, nil)
+	var out map[string]any
+	decode(c.t, res, &out)
+	if res.StatusCode != 200 {
+		c.t.Fatalf("get account %d %v", res.StatusCode, out)
+	}
+	return out
+}
+
+func errCode(m map[string]any) string {
+	e, _ := m["error"].(map[string]any)
+	if e == nil {
+		return ""
+	}
+	s, _ := e["code"].(string)
+	return s
+}
